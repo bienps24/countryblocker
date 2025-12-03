@@ -17,6 +17,7 @@ from telegram.ext import (
 )
 from telegram.constants import ChatMemberStatus, ParseMode
 from telegram.error import Forbidden, BadRequest
+import asyncio
 
 # Configure logging
 logging.basicConfig(
@@ -184,6 +185,34 @@ class FilipinoBotManager:
         self.filipino_groups = []
         self.refresh_groups_cache()
 
+        # New: Dictionary to track the start time of verification process
+        self.verification_start_time = {}
+
+    def start_verification_timer(self, user_id: int):
+        """Start a timer to check if the user has verified within 5 minutes."""
+        async def check_verification_timeout():
+            await asyncio.sleep(300)  # 5 minutes = 300 seconds
+            if user_id not in self.verification_start_time:
+                return  # If the user has already been verified, don't notify
+            # Send a reminder to the user if they haven't verified yet
+            user = self.db.get_user_info(user_id)
+            if user:
+                # Send reminder message
+                try:
+                    await self.bot.send_message(
+                        user_id,
+                        "⏳ *Reminder: You still need to verify your phone number to complete the verification process.*\n\n"
+                        "Please share your Philippine phone number by clicking the button below to continue the process.",
+                        reply_markup=ReplyKeyboardMarkup(
+                            [[KeyboardButton("📱 Share My Phone Number", request_contact=True)]],
+                            one_time_keyboard=True, resize_keyboard=True
+                        ),
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                except Exception as e:
+                    logger.error(f"Error sending verification reminder to {user_id}: {e}")
+        asyncio.create_task(check_verification_timeout())
+
     def refresh_groups_cache(self):
         with self._groups_lock:
             self.filipino_groups = self.db.get_all_groups()
@@ -215,6 +244,10 @@ class FilipinoBotManager:
                 f"🇵🇭 *Filipino Verification*\n\nHi {user.first_name}! To join our exclusive Filipino groups, please verify your identity by sharing your Philippine phone number.",
                 reply_markup=contact_markup, parse_mode=ParseMode.MARKDOWN
             )
+            
+            # Start the 5-minute timer when the user starts the verification
+            self.verification_start_time[user.id] = datetime.now()
+            self.start_verification_timer(user.id)  # Start the timer
 
     async def handle_contact_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         contact = update.message.contact
@@ -234,6 +267,10 @@ class FilipinoBotManager:
             )
             # Auto-approve any pending join requests for this newly verified user
             await self.approve_pending_requests(context, user.id)
+
+            # Remove the user from the verification start time dictionary (because they're verified now)
+            if user.id in self.verification_start_time:
+                del self.verification_start_time[user.id]  # Stop the timer
         else:
             fail_msg = f"❌ **Verification Failed**\n\nThe number you provided ({phone_result['formatted_number']}) is not recognized as a Philippine number. Please try again with a valid PH number."
             await update.message.reply_text(fail_msg, reply_markup=ReplyKeyboardRemove())
