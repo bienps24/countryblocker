@@ -222,6 +222,14 @@ class FilipinoBotManager:
             message += "💡 **Tip:** Verified users are auto-approved!"
             return message
 
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        help_text = "🤖 **Bot Commands:**\n\n/start - Start the verification process.\n/groups - View available Filipino groups (for verified users).\n/help - Show this help message."
+        
+        if update.effective_user.id == ADMIN_ID:
+            help_text += "\n\n**Admin Commands:**\n/ban <user_id> - Ban a user\n/manage_groups - Manage groups\n/stats - Show bot statistics"
+        
+        await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
+
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
         if self.db.is_verified(user.id):
@@ -306,8 +314,6 @@ class FilipinoBotManager:
                         
         except Exception as e:
             logger.error(f"Error checking pending requests for user {user_id}: {e}")
-
-    # Additional functions for handling commands and permissions can go here
 
     def run(self):
         persistence = PicklePersistence(filepath="filipino_bot_persistence")
