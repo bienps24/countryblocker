@@ -9,7 +9,7 @@ import phonenumbers
 from phonenumbers import NumberParseException
 
 from telegram import (
-    Update, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove,
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove,
     ChatMemberUpdated, ChatMember, ChatJoinRequest
 )
 from telegram.ext import (
@@ -75,6 +75,20 @@ class DatabaseManager:
                     description TEXT,
                     link TEXT UNIQUE NOT NULL,
                     chat_id INTEGER UNIQUE
+                )
+            ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS allowed_country_codes (
+                    chat_id INTEGER,
+                    country_code TEXT,
+                    PRIMARY KEY (chat_id, country_code)
+                )
+            ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS group_admins (
+                    chat_id INTEGER,
+                    user_id INTEGER,
+                    PRIMARY KEY (chat_id, user_id)
                 )
             ''')
             conn.commit()
@@ -143,43 +157,45 @@ class DatabaseManager:
             conn.commit()
             logger.info(f"Updated chat_id for group with link {link} to {chat_id}")
 
-    def add_join_request(self, user_id: int, chat_id: int):
+    def set_country_code_for_group(self, chat_id: int, country_code: str):
+        """Set allowed country code for the given group."""
         with self.get_conn() as conn:
-            conn.cursor().execute("INSERT OR REPLACE INTO join_requests (user_id, chat_id, request_date, status) VALUES (?, ?, ?, 'pending')", (user_id, chat_id, datetime.now()))
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO allowed_country_codes (chat_id, country_code)
+                VALUES (?, ?)
+            ''', (chat_id, country_code))
             conn.commit()
 
-    def update_join_request_status(self, user_id: int, chat_id: int, status: str):
-        with self.get_conn() as conn:
-            conn.cursor().execute("UPDATE join_requests SET status = ? WHERE user_id = ? AND chat_id = ?", (status, user_id, chat_id))
-            conn.commit()
-
-    def get_user_info(self, user_id: int) -> Optional[Dict[str, Any]]:
-        """Get user information from verified_users table."""
+    def get_allowed_country_codes_for_group(self, chat_id: int) -> List[str]:
+        """Get the allowed country codes for a group."""
         with self.get_conn() as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            cursor.execute('SELECT * FROM verified_users WHERE user_id = ?', (user_id,))
-            result = cursor.fetchone()
-            return dict(result) if result else None
+            cursor.execute('''
+                SELECT country_code FROM allowed_country_codes WHERE chat_id = ?
+            ''', (chat_id,))
+            return [row['country_code'] for row in cursor.fetchall()]
 
 class PhoneVerifier:
     @staticmethod
-    def verify_phone_number(phone_number: str) -> dict:
-        """Verify if a phone number is from the Philippines using a region hint."""
+    def verify_phone_number(phone_number: str, allowed_codes: List[str]) -> dict:
+        """Verify if a phone number matches one of the allowed country codes."""
         try:
-            parsed = phonenumbers.parse(phone_number, 'PH')
+            parsed = phonenumbers.parse(phone_number)
+            country_code = str(parsed.country_code)  # Get the country code
+            if country_code not in allowed_codes:
+                return {'is_valid': False, 'message': f"Only users from {', '.join(allowed_codes)} are allowed to join."}
             is_valid = phonenumbers.is_valid_number(parsed)
-            is_ph = phonenumbers.region_code_for_number(parsed) == 'PH'
-            
-            return {'is_filipino': is_valid and is_ph, 'formatted_number': phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.INTERNATIONAL)}
+            return {'is_valid': is_valid, 'country_code': country_code}
         except NumberParseException:
-            return {'is_filipino': False, 'formatted_number': phone_number}
+            return {'is_valid': False, 'message': "Invalid phone number format."}
 
 class FilipinoBotManager:
     def __init__(self):
         if not BOT_TOKEN: raise ValueError("BOT_TOKEN environment variable is required!")
         if not ADMIN_ID: raise ValueError("ADMIN_ID environment variable is required!")
-            
+        
         self.db = DatabaseManager()
         self.verifier = PhoneVerifier()
         self._groups_lock = threading.Lock()
@@ -232,9 +248,9 @@ class FilipinoBotManager:
             await update.message.reply_text("❌ Please share your own contact information.", reply_markup=ReplyKeyboardRemove())
             return
         
-        phone_result = self.verifier.verify_phone_number(contact.phone_number)
+        phone_result = self.verifier.verify_phone_number(contact.phone_number, self.db.get_allowed_country_codes_for_group(0))
         
-        if phone_result['is_filipino']:
+        if phone_result['is_valid']:
             self.db.add_verified_user(user.id, user.username, user.first_name, contact.phone_number)
             success_msg = f"✅ **VERIFIED!** 🇵🇭\n\nWelcome, {user.first_name}!\n\nYour number {phone_result['formatted_number']} is verified. You now have access to all our groups and will be auto-approved.\n\n{self.format_available_groups()}"
             await update.message.reply_text(success_msg, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True, reply_markup=ReplyKeyboardRemove())
@@ -292,321 +308,7 @@ class FilipinoBotManager:
         except Exception as e:
             logger.error(f"Error checking pending requests for user {user_id}: {e}")
 
-    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        help_text = "🤖 **Bot Commands:**\n\n`/start` - Start the verification process.\n`/groups` - View available Filipino groups (for verified users).\n`/help` - Show this help message."
-        
-        if update.effective_user.id == ADMIN_ID:
-            help_text += "\n\n**Admin Commands:**\n`/ban <user_id>` - Ban a user\n`/manage_groups` - Manage groups\n`/stats` - Show bot statistics"
-        
-        await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
-
-    async def groups_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if self.db.is_verified(update.effective_user.id):
-            await update.message.reply_text(self.format_available_groups(), parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
-        else:
-            await update.message.reply_text("❌ You must be a verified user to see the list of groups. Please use /start to begin verification.")
-
-    async def ban_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.effective_user.id != ADMIN_ID: 
-            await update.message.reply_text("❌ You don't have permission to use this command.")
-            return
-            
-        if not context.args:
-            await update.message.reply_text("Usage: `/ban <user_id>`", parse_mode=ParseMode.MARKDOWN)
-            return
-            
-        try:
-            user_id = int(context.args[0])
-            self.db.ban_user(user_id)
-            await update.message.reply_text(f"🚫 User `{user_id}` is now banned.", parse_mode=ParseMode.MARKDOWN)
-            
-            # Remove banned user from all groups
-            with self._groups_lock:
-                for group in self.filipino_groups:
-                    if group['chat_id']:
-                        try:
-                            await context.bot.ban_chat_member(chat_id=group['chat_id'], user_id=user_id)
-                            logger.info(f"Banned user {user_id} from group {group['name']}")
-                        except Exception as e:
-                            logger.error(f"Failed to kick banned user {user_id} from {group['name']}: {e}")
-        except (ValueError, IndexError):
-            await update.message.reply_text("❌ Invalid user ID. Please provide a valid numeric user ID.")
-
-    async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show bot statistics (Admin only)."""
-        if update.effective_user.id != ADMIN_ID:
-            await update.message.reply_text("❌ You don't have permission to use this command.")
-            return
-
-        with self.db.get_conn() as conn:
-            cursor = conn.cursor()
-            
-            # Get verified users count
-            cursor.execute('SELECT COUNT(*) FROM verified_users WHERE is_banned = FALSE')
-            verified_count = cursor.fetchone()[0]
-            
-            # Get banned users count
-            cursor.execute('SELECT COUNT(*) FROM verified_users WHERE is_banned = TRUE')
-            banned_count = cursor.fetchone()[0]
-            
-            # Get groups count
-            cursor.execute('SELECT COUNT(*) FROM managed_groups')
-            groups_count = cursor.fetchone()[0]
-            
-            # Get pending join requests
-            cursor.execute('SELECT COUNT(*) FROM join_requests WHERE status = "pending"')
-            pending_requests = cursor.fetchone()[0]
-
-        stats_text = f"""📊 **Bot Statistics**
-
-👥 **Users:**
-• Verified: {verified_count}
-• Banned: {banned_count}
-
-🏢 **Groups:** {groups_count}
-
-⏳ **Pending Join Requests:** {pending_requests}
-"""
-        await update.message.reply_text(stats_text, parse_mode=ParseMode.MARKDOWN)
-            
-    async def manage_groups_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Admin command to manage groups."""
-        if update.effective_user.id != ADMIN_ID:
-            await update.message.reply_text("❌ You don't have permission to use this command.")
-            return
-
-        if not context.args:
-            # Show help for manage_groups command
-            help_text = """🏢 **Group Management Commands:**
-
-**Add Group:**
-`/manage_groups add "Group Name" "Description" "https://t.me/grouplink"`
-
-**Remove Group:**
-`/manage_groups remove <group_id>`
-
-**List Groups:**
-`/manage_groups list`
-
-**Refresh Cache:**
-`/manage_groups refresh`
-"""
-            await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
-            return
-
-        action = context.args[0].lower()
-
-        if action == "add":
-            if len(context.args) < 4:
-                await update.message.reply_text("❌ Usage: `/manage_groups add \"Group Name\" \"Description\" \"https://t.me/grouplink\"`", parse_mode=ParseMode.MARKDOWN)
-                return
-            
-            name = context.args[1].strip('"')
-            description = context.args[2].strip('"')
-            link = context.args[3].strip('"')
-            
-            if self.db.add_group(name, description, link):
-                self.refresh_groups_cache()
-                await update.message.reply_text(f"✅ Group **{name}** added successfully!", parse_mode=ParseMode.MARKDOWN)
-            else:
-                await update.message.reply_text("❌ Failed to add group. Check if the link is valid and not already in use.")
-
-        elif action == "remove":
-            if len(context.args) < 2:
-                await update.message.reply_text("❌ Usage: `/manage_groups remove <group_id>`", parse_mode=ParseMode.MARKDOWN)
-                return
-            
-            try:
-                group_id = int(context.args[1])
-                removed_group = self.db.remove_group(group_id)
-                if removed_group:
-                    self.refresh_groups_cache()
-                    await update.message.reply_text(f"✅ Group **{removed_group['name']}** removed successfully!", parse_mode=ParseMode.MARKDOWN)
-                else:
-                    await update.message.reply_text("❌ Group not found.")
-            except ValueError:
-                await update.message.reply_text("❌ Please provide a valid group ID.")
-
-        elif action == "list":
-            groups = self.db.get_all_groups()
-            if not groups:
-                await update.message.reply_text("📝 No groups found.")
-                return
-            
-            message = "📋 **Managed Groups:**\n\n"
-            for group in groups:
-                message += f"**ID:** {group['id']}\n"
-                message += f"**Name:** {group['name']}\n"
-                message += f"**Description:** {group['description']}\n"
-                message += f"**Link:** {group['link']}\n"
-                message += f"**Chat ID:** {group['chat_id'] or 'Not set'}\n\n"
-            
-            await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
-
-        elif action == "refresh":
-            self.refresh_groups_cache()
-            await update.message.reply_text("✅ Groups cache refreshed successfully!")
-
-        else:
-            await update.message.reply_text("❌ Unknown action. Use: add, remove, list, or refresh")
-            
-    async def handle_join_request(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle join requests to groups."""
-        join_request: ChatJoinRequest = update.chat_join_request
-        user = join_request.from_user
-        chat = join_request.chat
-        
-        logger.info(f"Join request from {user.first_name} (@{user.username}) to {chat.title}")
-        
-        # Log the join request
-        self.db.add_join_request(user.id, chat.id)
-        
-        # Check if user is verified
-        if self.db.is_verified(user.id):
-            try:
-                # Auto-approve verified users
-                await context.bot.approve_chat_join_request(chat_id=chat.id, user_id=user.id)
-                self.db.update_join_request_status(user.id, chat.id, "approved")
-                
-                # Welcome message
-                try:
-                    await context.bot.send_message(
-                        chat_id=user.id,
-                        text=f"✅ Welcome to **{chat.title}**! You've been automatically approved as a verified Filipino user. 🇵🇭",
-                        parse_mode=ParseMode.MARKDOWN
-                    )
-                except Exception as e:
-                    logger.warning(f"Could not send welcome message to {user.id}: {e}")
-                
-                # Notify admin
-                await context.bot.send_message(
-                    ADMIN_ID,
-                    f"✅ Auto-approved verified user: {user.first_name} (@{user.username or 'N/A'}) to {chat.title}",
-                    parse_mode=ParseMode.MARKDOWN
-                )
-                
-                logger.info(f"Auto-approved verified user {user.id} to {chat.title}")
-                
-            except Exception as e:
-                logger.error(f"Failed to approve join request: {e}")
-                self.db.update_join_request_status(user.id, chat.id, "error")
-        else:
-            # DON'T decline - keep request pending and guide user to verify
-            try:
-                # Just inform user how to get verified - DON'T decline the request
-                await context.bot.send_message(
-                    chat_id=user.id,
-                    text=f"⏳ **Verification Required for {chat.title}**\n\nHi {user.first_name}! Your join request is **pending**.\n\nTo get automatically approved, you need to verify your Philippine phone number first.\n\n👉 Start verification by messaging me with /start\n\n✅ Once verified, you'll be **automatically approved** without needing to request again!",
-                    parse_mode=ParseMode.MARKDOWN
-                )
-                
-                # Notify admin about pending request
-                await context.bot.send_message(
-                    ADMIN_ID,
-                    f"⏳ Pending verification: {user.first_name} (@{user.username or 'N/A'}) wants to join {chat.title}",
-                    parse_mode=ParseMode.MARKDOWN
-                )
-                
-                logger.info(f"User {user.id} request pending verification for {chat.title}")
-                
-            except Exception as e:
-                logger.warning(f"Could not send verification message to {user.id}: {e}")
-                # Still notify admin even if we can't message the user
-                try:
-                    await context.bot.send_message(
-                        ADMIN_ID,
-                        f"⏳ Pending verification (no DM): {user.first_name} (@{user.username or 'N/A'}) wants to join {chat.title}",
-                        parse_mode=ParseMode.MARKDOWN
-                    )
-                except:
-                    pass
-        
-    async def handle_chat_member_update(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle chat member updates (users joining/leaving groups)."""
-        chat_member_update: ChatMemberUpdated = update.chat_member
-        user = chat_member_update.from_user
-        chat = chat_member_update.chat
-        old_status = chat_member_update.old_chat_member.status
-        new_status = chat_member_update.new_chat_member.status
-        
-        # Log member status changes
-        if old_status != new_status:
-            logger.info(f"User {user.first_name} ({user.id}) status changed from {old_status} to {new_status} in {chat.title}")
-            
-            # If user was banned, update their status
-            if new_status == ChatMemberStatus.BANNED:
-                self.db.ban_user(user.id)
-                await context.bot.send_message(
-                    ADMIN_ID,
-                    f"🚫 User {user.first_name} (@{user.username or 'N/A'}) was banned from {chat.title}",
-                    parse_mode=ParseMode.MARKDOWN
-                )
-
-    async def handle_my_chat_member_update(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle updates to the bot's own membership status."""
-        chat_member_update: ChatMemberUpdated = update.my_chat_member
-        chat = chat_member_update.chat
-        old_status = chat_member_update.old_chat_member.status
-        new_status = chat_member_update.new_chat_member.status
-        
-        logger.info(f"Bot status changed from {old_status} to {new_status} in {chat.title}")
-        
-        # If bot was added to a group, try to update the chat_id in database
-        if new_status in [ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR]:
-            # Get the actual invite link from the chat if available
-            invite_link = None
-            try:
-                # Try to get the primary invite link
-                invite_link = await context.bot.export_chat_invite_link(chat.id)
-                logger.info(f"Got invite link for {chat.title}: {invite_link}")
-            except Exception as e:
-                logger.warning(f"Could not get invite link for {chat.title}: {e}")
-            
-            # Try to match with stored groups
-            groups = self.db.get_all_groups()
-            updated = False
-            
-            for group in groups:
-                # Check multiple matching criteria
-                match_found = False
-                
-                # 1. Try to match by invite link (works for both public and private groups)
-                if invite_link and group['link'] == invite_link:
-                    match_found = True
-                
-                # 2. Try to match by username (for public groups only)
-                elif 't.me/' in group['link'] and not group['link'].startswith('t.me/+'):
-                    stored_username = group['link'].split('t.me/')[-1].split('?')[0]  # Remove query params
-                    if chat.username and chat.username.lower() == stored_username.lower():
-                        match_found = True
-                
-                # 3. Try to match by chat title (fallback, less reliable)
-                elif not updated and group['name'].lower() == chat.title.lower():
-                    match_found = True
-                    logger.warning(f"Matched group by title (less reliable): {chat.title}")
-                
-                if match_found:
-                    self.db.update_chat_id_by_link(group['link'], chat.id)
-                    self.refresh_groups_cache()
-                    updated = True
-                    logger.info(f"Updated chat_id for group '{group['name']}' to {chat.id}")
-                    break
-            
-            if not updated:
-                logger.warning(f"Could not match group {chat.title} (ID: {chat.id}) with any stored group")
-            
-            await context.bot.send_message(
-                ADMIN_ID,
-                f"🤖 Bot added to group: **{chat.title}** (ID: `{chat.id}`)\n{'✅ Matched with stored group' if updated else '⚠️ No matching stored group found'}",
-                parse_mode=ParseMode.MARKDOWN
-            )
-        
-        elif new_status in [ChatMemberStatus.LEFT, ChatMemberStatus.BANNED]:
-            await context.bot.send_message(
-                ADMIN_ID,
-                f"👋 Bot removed from group: **{chat.title}** (ID: `{chat.id}`)",
-                parse_mode=ParseMode.MARKDOWN
-            )
+    # Additional functions for handling commands and permissions can go here
 
     def run(self):
         persistence = PicklePersistence(filepath="filipino_bot_persistence")
@@ -616,9 +318,6 @@ class FilipinoBotManager:
         application.add_handler(CommandHandler("start", self.start_command))
         application.add_handler(CommandHandler("help", self.help_command))
         application.add_handler(CommandHandler("groups", self.groups_command))
-        application.add_handler(CommandHandler("ban", self.ban_command))
-        application.add_handler(CommandHandler("stats", self.stats_command))
-        application.add_handler(CommandHandler("manage_groups", self.manage_groups_command))
         
         # Message handlers
         application.add_handler(MessageHandler(filters.CONTACT, self.handle_contact_message))
