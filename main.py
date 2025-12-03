@@ -7,9 +7,8 @@ from typing import Optional, List, Dict, Any
 from contextlib import contextmanager
 import phonenumbers
 from phonenumbers import NumberParseException
-
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove,
+    Update, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup,
     ChatMemberUpdated, ChatMember, ChatJoinRequest
 )
 from telegram.ext import (
